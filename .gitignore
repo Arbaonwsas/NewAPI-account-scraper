@@ -1,0 +1,11 @@
+# Sensitive local captures and credentials
+captures/*.har
+.env
+.env.*
+!.env.example
+
+# Common local artifacts
+node_modules/
+dist/
+build/
+.DS_Store
