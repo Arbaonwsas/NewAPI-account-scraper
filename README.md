@@ -1,5 +1,7 @@
 # HyperAPI Account Monitor / HyperAPI 余额监控
 
+![HyperAPI macOS desktop widget screenshot](assets/widget-screenshot.png)
+
 > 中文说明在前，English version follows.
 
 ## 中文
