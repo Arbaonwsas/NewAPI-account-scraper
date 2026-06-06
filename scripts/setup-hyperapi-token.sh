@@ -65,23 +65,31 @@ api_request() {
     headers+=(-H "new-api-user: $user_id")
   fi
 
-  if [[ "$method" == "POST" ]]; then
-    status="$(curl -sS \
-      -X POST "$BASE_URL$path" \
-      -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
-      "${headers[@]}" \
-      -H "content-type: application/json" \
-      --data "$data" \
-      -o "$out" \
-      -w "%{http_code}")"
-  else
-    status="$(curl -sS \
-      -X GET "$BASE_URL$path" \
-      -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
-      "${headers[@]}" \
-      -o "$out" \
-      -w "%{http_code}")"
-  fi
+  for attempt in 1 2; do
+    if [[ "$method" == "POST" ]]; then
+      status="$(curl -sS \
+        -X POST "$BASE_URL$path" \
+        -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+        "${headers[@]}" \
+        -H "content-type: application/json" \
+        --data "$data" \
+        -o "$out" \
+        -w "%{http_code}")" && break
+    else
+      status="$(curl -sS \
+        -X GET "$BASE_URL$path" \
+        -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+        "${headers[@]}" \
+        -o "$out" \
+        -w "%{http_code}")" && break
+    fi
+
+    if [[ "$attempt" == "2" ]]; then
+      echo "Error: $method $path failed before receiving an HTTP response." >&2
+      exit 1
+    fi
+    sleep 1
+  done
 
   if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
     echo "Error: $method $path returned HTTP $status" >&2

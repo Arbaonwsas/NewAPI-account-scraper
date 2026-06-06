@@ -1,11 +1,31 @@
 # Sensitive local captures and credentials
-captures/*.har
 .env
 .env.*
 !.env.example
+captures/
+*.har
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.mobileprovision
+*.provisionprofile
+id_rsa*
+id_ed25519*
 
 # Common local artifacts
 node_modules/
+.build/
+.swiftpm/
+DerivedData/
 dist/
 build/
+*.log
+*.tmp
 .DS_Store
+
+# Xcode local user state
+*.xcuserstate
+xcuserdata/

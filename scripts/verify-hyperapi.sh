@@ -103,21 +103,29 @@ request_json() {
     headers+=(-H "cookie: $COOKIE")
   fi
 
-  if [[ "$method" == "POST" ]]; then
-    status="$(curl -sS \
-      -X POST "$BASE_URL$path" \
-      "${headers[@]}" \
-      -H "content-type: application/json" \
-      --data "$body" \
-      -o "$out" \
-      -w "%{http_code}")"
-  else
-    status="$(curl -sS \
-      -X GET "$BASE_URL$path" \
-      "${headers[@]}" \
-      -o "$out" \
-      -w "%{http_code}")"
-  fi
+  for attempt in 1 2; do
+    if [[ "$method" == "POST" ]]; then
+      status="$(curl -sS \
+        -X POST "$BASE_URL$path" \
+        "${headers[@]}" \
+        -H "content-type: application/json" \
+        --data "$body" \
+        -o "$out" \
+        -w "%{http_code}")" && break
+    else
+      status="$(curl -sS \
+        -X GET "$BASE_URL$path" \
+        "${headers[@]}" \
+        -o "$out" \
+        -w "%{http_code}")" && break
+    fi
+
+    if [[ "$attempt" == "2" ]]; then
+      echo "Error: $method $path failed before receiving an HTTP response." >&2
+      return 1
+    fi
+    sleep 1
+  done
 
   if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
     echo "Error: $method $path returned HTTP $status" >&2
@@ -155,19 +163,27 @@ request_json GET "/api/subscription/plans" "$PLANS"
 quota="$(jq -r '.data.quota // 0' "$USER_SELF")"
 request_json POST "/api/user/amount" "$AMOUNT" "{\"amount\":$quota}"
 
-jq -n \
+TZ=Asia/Shanghai jq -n \
   --slurpfile user "$USER_SELF" \
   --slurpfile sub "$SUB_SELF" \
   --slurpfile plans "$PLANS" \
   --slurpfile amount "$AMOUNT" \
   --arg fetchedAt "$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S %Z')" '
+  def cents($v):
+    if ($v | type) != "number" then null
+    else
+      (($v / 5000 + 0.5) | floor) as $c
+      | if $v > 0 and $c == 0 then 1 else $c end
+    end;
+
   def money($v):
-    if ($v | type) == "number" then
-      "$" + (($v / 500000) | tostring | split(".") as $parts
-        | if ($parts | length) == 1 then $parts[0] + ".00"
-          else $parts[0] + "." + (($parts[1] + "00")[0:2])
-          end)
-    else null end;
+    cents($v) as $c
+    | if $c == null then null
+      else
+        ($c / 100 | floor | tostring) as $d
+        | ($c % 100 | tostring) as $cent
+        | "$" + $d + "." + (if ($cent | length) == 1 then "0" + $cent else $cent end)
+      end;
 
   def percent($used; $total):
     if ($total // 0) <= 0 then 0
@@ -205,9 +221,9 @@ jq -n \
             used: money(.amount_used),
             total: money(.amount_total),
             remaining: money(.amount_total - .amount_used),
-            usedPercent: (percent(.amount_used; .amount_total) | floor),
-            endTime: (.end_time | strftime("%Y-%m-%d %H:%M:%S")),
-            nextResetTime: (if (.next_reset_time // 0) > 0 then (.next_reset_time | strftime("%Y-%m-%d %H:%M:%S")) else null end)
+            usedPercent: (percent(.amount_used; .amount_total) + 0.5 | floor),
+            endTime: (.end_time | strflocaltime("%Y-%m-%d %H:%M:%S")),
+            nextResetTime: (if (.next_reset_time // 0) > 0 then (.next_reset_time | strflocaltime("%Y-%m-%d %H:%M:%S")) else null end)
           })
       )
     }
