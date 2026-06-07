@@ -1,4 +1,5 @@
 import AppKit
+import Charts
 import Foundation
 import Security
 import SwiftUI
@@ -48,7 +49,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         let config = WidgetWindowConfig.load()
         let panel = DesktopWidgetPanel(config: config)
         panel.contentView = NSHostingView(rootView: DesktopWidget().environmentObject(viewModel))
-        panel.orderFrontRegardless()
+        panel.showForLaunch()
         self.panel = panel
     }
 
@@ -75,7 +76,7 @@ struct WidgetWindowConfig {
             x: CGFloat(Double(env["HYPERAPI_WIDGET_X"] ?? "") ?? 38),
             yFromTop: CGFloat(Double(env["HYPERAPI_WIDGET_Y"] ?? "") ?? 240),
             width: CGFloat(Double(env["HYPERAPI_WIDGET_WIDTH"] ?? "") ?? 344),
-            height: CGFloat(Double(env["HYPERAPI_WIDGET_HEIGHT"] ?? "") ?? 430)
+            height: CGFloat(Double(env["HYPERAPI_WIDGET_HEIGHT"] ?? "") ?? 650)
         )
     }
 }
@@ -120,6 +121,16 @@ final class DesktopWidgetPanel: NSPanel {
             orderFrontRegardless()
         }
     }
+
+    func showForLaunch() {
+        ignoresMouseEvents = false
+        level = .floating
+        orderFrontRegardless()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.setPositioningMode(false)
+        }
+    }
 }
 
 @MainActor
@@ -130,13 +141,54 @@ final class MonitorViewModel: ObservableObject {
     @Published private(set) var isLoading = false
     @Published private(set) var lastError: String?
     @Published private(set) var consumptionEvents: [ConsumptionEvent] = []
+    @Published private(set) var refreshCountdown: Int = Int(RefreshInterval.thirtySeconds.seconds)
+    @Published private(set) var consumptionRateText = ""
+    @Published private(set) var consumptionRateSamples: [ConsumptionRateSample] = [] {
+        didSet {
+            persistConsumptionRateSamples()
+        }
+    }
     @Published var isConsumptionEffectEnabled: Bool {
         didSet {
             UserDefaults.standard.set(isConsumptionEffectEnabled, forKey: "isConsumptionEffectEnabled")
         }
     }
     @Published var refreshInterval: RefreshInterval = .thirtySeconds {
-        didSet { scheduleTimer() }
+        didSet {
+            UserDefaults.standard.set(refreshInterval.rawValue, forKey: "refreshInterval")
+            scheduleTimer()
+        }
+    }
+    @Published var consumptionRateUnit: ConsumptionRateUnit = .perMinute {
+        didSet {
+            UserDefaults.standard.set(consumptionRateUnit.rawValue, forKey: "consumptionRateUnit")
+            updateConsumptionRateText()
+        }
+    }
+    @Published var isConsumptionRateChartVisible: Bool = true {
+        didSet {
+            UserDefaults.standard.set(isConsumptionRateChartVisible, forKey: "isConsumptionRateChartVisible")
+        }
+    }
+    @Published var consumptionRateChartUnit: ConsumptionRateUnit = .perMinute {
+        didSet {
+            UserDefaults.standard.set(consumptionRateChartUnit.rawValue, forKey: "consumptionRateChartUnit")
+        }
+    }
+    @Published var isConsumptionRateChartSmoothed: Bool = true {
+        didSet {
+            UserDefaults.standard.set(isConsumptionRateChartSmoothed, forKey: "isConsumptionRateChartSmoothed")
+        }
+    }
+    @Published var progressFillMode: ProgressFillMode = .theme {
+        didSet {
+            UserDefaults.standard.set(progressFillMode.rawValue, forKey: "progressFillMode")
+        }
+    }
+    @Published var progressThemeColor: ProgressThemeColor = .aurora {
+        didSet {
+            UserDefaults.standard.set(progressThemeColor.rawValue, forKey: "progressThemeColor")
+        }
     }
     @Published var menuBarSelection: String {
         didSet {
@@ -161,11 +213,15 @@ final class MonitorViewModel: ObservableObject {
 
     private let client = HyperAPIClient()
     private var timerTask: Task<Void, Never>?
+    private var nextRefreshDate = Date().addingTimeInterval(RefreshInterval.thirtySeconds.seconds)
+    private var consumptionRateRawPerSecond: Double = 0
 
     var menuBarTitle: String {
-        if isLoading { return "AI ..." }
-        if lastError != nil { return "AI !" }
-        guard let snapshot else { return "AI 余额" }
+        guard let snapshot else {
+            if isLoading { return "AI ..." }
+            if lastError != nil { return "AI !" }
+            return "AI 余额"
+        }
 
         switch MenuBarSelection(rawValue: menuBarSelection) {
         case .currentBalance:
@@ -181,6 +237,18 @@ final class MonitorViewModel: ObservableObject {
         case .none:
             return snapshot.currentBalance
         }
+    }
+
+    var refreshCountdownText: String {
+        "\(max(0, refreshCountdown))秒"
+    }
+
+    var consumptionRateChartText: String {
+        ConsumptionRateFormatter.format(rawPerSecond: consumptionRateRawPerSecond, unit: consumptionRateChartUnit)
+    }
+
+    var activeSubscriptions: [SubscriptionDisplay] {
+        snapshot?.validSubscriptions ?? []
     }
 
     var validSubscriptions: [SubscriptionDisplay] {
@@ -201,11 +269,24 @@ final class MonitorViewModel: ObservableObject {
     }
 
     var maxSubscriptionLimit: Int {
-        max(1, min(12, validSubscriptions.count))
+        max(1, min(12, activeSubscriptions.count))
     }
 
     init() {
         let defaults = UserDefaults.standard
+        let savedRefreshInterval = defaults.string(forKey: "refreshInterval").flatMap(RefreshInterval.init(rawValue:)) ?? .thirtySeconds
+        refreshInterval = savedRefreshInterval
+        refreshCountdown = Int(savedRefreshInterval.seconds)
+        nextRefreshDate = Date().addingTimeInterval(savedRefreshInterval.seconds)
+        let savedConsumptionRateUnit = defaults.string(forKey: "consumptionRateUnit").flatMap(ConsumptionRateUnit.init(rawValue:)) ?? .perMinute
+        consumptionRateUnit = savedConsumptionRateUnit
+        consumptionRateText = ConsumptionRateFormatter.format(rawPerSecond: 0, unit: savedConsumptionRateUnit)
+        isConsumptionRateChartVisible = defaults.object(forKey: "isConsumptionRateChartVisible") as? Bool ?? true
+        consumptionRateChartUnit = defaults.string(forKey: "consumptionRateChartUnit").flatMap(ConsumptionRateUnit.init(rawValue:)) ?? savedConsumptionRateUnit
+        isConsumptionRateChartSmoothed = defaults.object(forKey: "isConsumptionRateChartSmoothed") as? Bool ?? true
+        progressFillMode = defaults.string(forKey: "progressFillMode").flatMap(ProgressFillMode.init(rawValue:)) ?? .theme
+        progressThemeColor = defaults.string(forKey: "progressThemeColor").flatMap(ProgressThemeColor.init(rawValue:)) ?? .aurora
+        consumptionRateSamples = Self.loadConsumptionRateSamples(from: defaults)
         menuBarSelection = defaults.string(forKey: "menuBarSelection") ?? MenuBarSelection.currentBalance.rawValue
         let savedLimit = defaults.integer(forKey: "widgetSubscriptionLimit")
         widgetSubscriptionLimit = savedLimit == 0 ? 3 : min(max(savedLimit, 1), 12)
@@ -222,9 +303,21 @@ final class MonitorViewModel: ObservableObject {
         guard !isLoading else { return }
         isLoading = true
         lastError = nil
+        defer {
+            isLoading = false
+            resetRefreshCountdown()
+        }
 
         do {
             let newSnapshot = try await client.fetchSnapshot()
+            if let oldSnapshot = snapshot {
+                updateConsumptionRate(from: oldSnapshot, to: newSnapshot)
+            } else {
+                consumptionRateRawPerSecond = 0
+                updateConsumptionRateText()
+            }
+            recordConsumptionRateSample()
+            reconcileSubscriptionSettings(with: newSnapshot.validSubscriptions)
             if isConsumptionEffectEnabled, let oldSnapshot = snapshot {
                 registerConsumptionEvents(from: oldSnapshot, to: newSnapshot)
             }
@@ -232,17 +325,23 @@ final class MonitorViewModel: ObservableObject {
         } catch {
             lastError = error.localizedDescription
         }
-
-        isLoading = false
     }
 
     func scheduleTimer() {
         timerTask?.cancel()
+        resetRefreshCountdown()
         timerTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
-                try? await Task.sleep(for: .seconds(refreshInterval.seconds))
-                await self.refresh()
+                self.updateRefreshCountdown()
+                if self.isAutoRefreshDue {
+                    await self.refresh()
+                }
+                do {
+                    try await Task.sleep(for: .seconds(1))
+                } catch {
+                    return
+                }
             }
         }
     }
@@ -294,6 +393,79 @@ final class MonitorViewModel: ObservableObject {
         }
     }
 
+    private var isAutoRefreshDue: Bool {
+        Date() >= nextRefreshDate && !isLoading
+    }
+
+    private func resetRefreshCountdown() {
+        nextRefreshDate = Date().addingTimeInterval(refreshInterval.seconds)
+        refreshCountdown = Int(refreshInterval.seconds)
+    }
+
+    private func updateRefreshCountdown() {
+        refreshCountdown = max(0, Int(ceil(nextRefreshDate.timeIntervalSinceNow)))
+    }
+
+    private func updateConsumptionRate(from oldSnapshot: AccountSnapshot, to newSnapshot: AccountSnapshot) {
+        let elapsedSeconds = max(1, newSnapshot.updatedAt.timeIntervalSince(oldSnapshot.updatedAt))
+        let balanceConsumedRaw = max(0, oldSnapshot.currentBalanceRaw - newSnapshot.currentBalanceRaw)
+        let oldSubscriptionsByID = Dictionary(uniqueKeysWithValues: oldSnapshot.validSubscriptions.map { ($0.id, $0) })
+        let subscriptionConsumedRaw = newSnapshot.validSubscriptions.reduce(Int64(0)) { total, subscription in
+            guard let oldSubscription = oldSubscriptionsByID[subscription.id] else { return total }
+            return total + max(0, oldSubscription.remainingRaw - subscription.remainingRaw)
+        }
+        let consumedRaw = balanceConsumedRaw + subscriptionConsumedRaw
+        consumptionRateRawPerSecond = Double(consumedRaw) / elapsedSeconds
+        updateConsumptionRateText()
+    }
+
+    private func updateConsumptionRateText() {
+        consumptionRateText = ConsumptionRateFormatter.format(rawPerSecond: consumptionRateRawPerSecond, unit: consumptionRateUnit)
+    }
+
+    private func reconcileSubscriptionSettings(with subscriptions: [SubscriptionDisplay]) {
+        let validIDs = Set(subscriptions.map(\.id))
+        let prunedHiddenIDs = hiddenSubscriptionIDList.filter { validIDs.contains($0) }
+        if hiddenSubscriptionIDList != prunedHiddenIDs {
+            hiddenSubscriptionIDList = prunedHiddenIDs
+        }
+
+        let clampedLimit = max(1, min(widgetSubscriptionLimit, min(12, max(subscriptions.count, 1))))
+        if widgetSubscriptionLimit != clampedLimit {
+            widgetSubscriptionLimit = clampedLimit
+        }
+
+        switch MenuBarSelection(rawValue: menuBarSelection) {
+        case .subscriptionAmount(let id), .subscriptionPercent(let id):
+            if !validIDs.contains(id) {
+                menuBarSelection = MenuBarSelection.currentBalance.rawValue
+            }
+        case .currentBalance, .historicalUsage, .requestCount, .none:
+            break
+        }
+    }
+
+    private func recordConsumptionRateSample(now: Date = Date()) {
+        let sample = ConsumptionRateSample(timestamp: now, rawPerSecond: consumptionRateRawPerSecond)
+        let cutoff = now.addingTimeInterval(-86_400)
+        consumptionRateSamples = (consumptionRateSamples + [sample])
+            .filter { $0.timestamp >= cutoff }
+    }
+
+    private func persistConsumptionRateSamples() {
+        guard let data = try? JSONEncoder().encode(consumptionRateSamples) else { return }
+        UserDefaults.standard.set(data, forKey: "consumptionRateSamples")
+    }
+
+    private static func loadConsumptionRateSamples(from defaults: UserDefaults) -> [ConsumptionRateSample] {
+        guard let data = defaults.data(forKey: "consumptionRateSamples"),
+              let samples = try? JSONDecoder().decode([ConsumptionRateSample].self, from: data) else {
+            return []
+        }
+        let cutoff = Date().addingTimeInterval(-86_400)
+        return samples.filter { $0.timestamp >= cutoff }
+    }
+
     private func registerConsumptionEvents(from oldSnapshot: AccountSnapshot, to newSnapshot: AccountSnapshot) {
         var events: [ConsumptionEvent] = []
         let balanceDelta = oldSnapshot.currentBalanceRaw - newSnapshot.currentBalanceRaw
@@ -343,6 +515,17 @@ struct ConsumptionEvent: Identifiable, Equatable {
     let kind: Kind
     let text: String
     let horizontalRatio: Double
+}
+
+struct ConsumptionRateSample: Identifiable, Codable, Equatable {
+    let timestamp: Date
+    let rawPerSecond: Double
+
+    var id: Date { timestamp }
+
+    func dollars(for unit: ConsumptionRateUnit) -> Double {
+        rawPerSecond * unit.seconds / 500_000.0
+    }
 }
 
 enum MenuBarSelection: RawRepresentable, Equatable {
@@ -403,6 +586,123 @@ enum RefreshInterval: String, CaseIterable, Identifiable {
         case .thirtySeconds: return 30
         case .oneMinute: return 60
         case .fiveMinutes: return 300
+        }
+    }
+}
+
+enum ConsumptionRateUnit: String, CaseIterable, Identifiable {
+    case perSecond
+    case perMinute
+    case perHour
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .perSecond: return "$/秒钟"
+        case .perMinute: return "$/分钟"
+        case .perHour: return "$/小时"
+        }
+    }
+
+    var periodName: String {
+        switch self {
+        case .perSecond: return "秒钟"
+        case .perMinute: return "分钟"
+        case .perHour: return "小时"
+        }
+    }
+
+    var seconds: Double {
+        switch self {
+        case .perSecond: return 1
+        case .perMinute: return 60
+        case .perHour: return 3600
+        }
+    }
+}
+
+enum ProgressFillMode: String, CaseIterable, Identifiable {
+    case theme
+    case rainbow
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .theme: return "主题色"
+        case .rainbow: return "动态彩虹"
+        }
+    }
+}
+
+enum ProgressThemeColor: String, CaseIterable, Identifiable {
+    case aurora
+    case ocean
+    case violet
+    case rose
+    case mint
+    case amber
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .aurora: return "极光"
+        case .ocean: return "海蓝"
+        case .violet: return "紫罗兰"
+        case .rose: return "玫瑰"
+        case .mint: return "薄荷"
+        case .amber: return "琥珀"
+        }
+    }
+
+    var colors: [Color] {
+        switch self {
+        case .aurora:
+            return [
+                Color(red: 0.14, green: 0.48, blue: 1.0),
+                Color(red: 0.48, green: 0.34, blue: 1.0),
+                Color(red: 0.92, green: 0.28, blue: 0.92)
+            ]
+        case .ocean:
+            return [
+                Color(red: 0.04, green: 0.53, blue: 0.95),
+                Color(red: 0.12, green: 0.84, blue: 0.98)
+            ]
+        case .violet:
+            return [
+                Color(red: 0.40, green: 0.28, blue: 1.0),
+                Color(red: 0.74, green: 0.36, blue: 1.0)
+            ]
+        case .rose:
+            return [
+                Color(red: 0.96, green: 0.25, blue: 0.56),
+                Color(red: 1.0, green: 0.45, blue: 0.74)
+            ]
+        case .mint:
+            return [
+                Color(red: 0.05, green: 0.78, blue: 0.58),
+                Color(red: 0.35, green: 0.95, blue: 0.74)
+            ]
+        case .amber:
+            return [
+                Color(red: 1.0, green: 0.58, blue: 0.14),
+                Color(red: 1.0, green: 0.82, blue: 0.24)
+            ]
+        }
+    }
+
+    var shadowColor: Color {
+        colors.last ?? .white
+    }
+}
+
+enum ProgressRainbow {
+    static func colors(at date: Date) -> [Color] {
+        let offset = date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 4) / 4
+        return stride(from: 0.0, through: 1.0, by: 0.2).map { step in
+            Color(hue: (step + offset).truncatingRemainder(dividingBy: 1), saturation: 0.78, brightness: 1.0)
         }
     }
 }
@@ -501,9 +801,9 @@ struct MenuBarSettingsPanel: View {
                     Text("历史消耗").tag(MenuBarSelection.historicalUsage.rawValue)
                     Text("请求次数").tag(MenuBarSelection.requestCount.rawValue)
 
-                    if !viewModel.validSubscriptions.isEmpty {
+                    if !viewModel.activeSubscriptions.isEmpty {
                         Divider()
-                        ForEach(viewModel.validSubscriptions) { subscription in
+                        ForEach(viewModel.activeSubscriptions) { subscription in
                             Text("\(subscription.shortTitleLine) 剩余额度")
                                 .tag(MenuBarSelection.subscriptionAmount(subscription.id).rawValue)
                             Text("\(subscription.shortTitleLine) 剩余百分比")
@@ -530,16 +830,27 @@ struct MenuBarSettingsPanel: View {
                         }
                     }
                     .pickerStyle(.segmented)
+
+                    Picker("消耗速率单位", selection: $viewModel.consumptionRateUnit) {
+                        ForEach(ConsumptionRateUnit.allCases) { unit in
+                            Text(unit.label).tag(unit)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    ConsumptionRateChartSettings()
+
+                    ProgressFillSettings()
                 }
 
-                if !viewModel.validSubscriptions.isEmpty {
+                if !viewModel.activeSubscriptions.isEmpty {
                     Divider()
 
                     VStack(alignment: .leading, spacing: 9) {
                         Text("悬浮窗订阅")
                             .font(.subheadline.weight(.semibold))
 
-                        ForEach(viewModel.validSubscriptions) { subscription in
+                        ForEach(viewModel.activeSubscriptions) { subscription in
                             Toggle(
                                 subscription.shortTitleLine,
                                 isOn: Binding(
@@ -582,6 +893,15 @@ struct DesktopWidget: View {
             DesktopGlassShell {
                 VStack(spacing: 12) {
                     CompactMetricsGrid(snapshot: viewModel.snapshot)
+                    if viewModel.isConsumptionRateChartVisible {
+                        ConsumptionRateChartPanel(
+                            samples: viewModel.consumptionRateSamples,
+                            unit: viewModel.consumptionRateChartUnit,
+                            currentRateText: viewModel.consumptionRateChartText,
+                            isSmoothed: viewModel.isConsumptionRateChartSmoothed
+                        )
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
                     CompactSubscriptionList()
 
                     HStack(spacing: 8) {
@@ -596,9 +916,18 @@ struct DesktopWidget: View {
 
                         Spacer()
 
-                        Text(viewModel.refreshInterval.rawValue)
+                        Text(viewModel.consumptionRateText)
+                            .font(.system(size: 10, weight: .medium))
+                            .monospacedDigit()
+                            .foregroundStyle(.white.opacity(0.38))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.78)
+
+                        Text(viewModel.refreshCountdownText)
                             .font(.system(size: 10, weight: .semibold))
+                            .monospacedDigit()
                             .foregroundStyle(.white.opacity(0.42))
+                            .frame(minWidth: 28, alignment: .trailing)
                     }
                     .padding(.horizontal, 6)
                 }
@@ -607,8 +936,206 @@ struct DesktopWidget: View {
 
             ConsumptionEffectLayer(events: viewModel.consumptionEvents)
         }
-        .frame(minWidth: 300, minHeight: 360)
+        .frame(minWidth: 300, minHeight: 620)
         .preferredColorScheme(.dark)
+    }
+}
+
+struct ConsumptionRateChartSettings: View {
+    @EnvironmentObject private var viewModel: MonitorViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle("显示 24 小时消耗速率图", isOn: $viewModel.isConsumptionRateChartVisible)
+                .font(.subheadline.weight(.semibold))
+
+            Picker("图表单位", selection: $viewModel.consumptionRateChartUnit) {
+                ForEach(ConsumptionRateUnit.allCases) { unit in
+                    Text(unit.label).tag(unit)
+                }
+            }
+            .pickerStyle(.segmented)
+            .disabled(!viewModel.isConsumptionRateChartVisible)
+
+            Toggle("平滑曲线", isOn: $viewModel.isConsumptionRateChartSmoothed)
+                .disabled(!viewModel.isConsumptionRateChartVisible)
+        }
+    }
+}
+
+struct ProgressFillSettings: View {
+    @EnvironmentObject private var viewModel: MonitorViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Picker("进度条填充", selection: $viewModel.progressFillMode) {
+                ForEach(ProgressFillMode.allCases) { mode in
+                    Text(mode.label).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            Picker("主题色", selection: $viewModel.progressThemeColor) {
+                ForEach(ProgressThemeColor.allCases) { theme in
+                    HStack(spacing: 7) {
+                        ThemeColorSwatch(theme: theme)
+                        Text(theme.label)
+                    }
+                    .tag(theme)
+                }
+            }
+            .disabled(viewModel.progressFillMode == .rainbow)
+        }
+    }
+}
+
+struct ThemeColorSwatch: View {
+    let theme: ProgressThemeColor
+
+    var body: some View {
+        Circle()
+            .fill(
+                LinearGradient(
+                    colors: theme.colors,
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            )
+            .frame(width: 12, height: 12)
+            .overlay(Circle().stroke(.primary.opacity(0.18), lineWidth: 0.5))
+    }
+}
+
+struct ConsumptionRateChartPanel: View {
+    let samples: [ConsumptionRateSample]
+    let unit: ConsumptionRateUnit
+    let currentRateText: String
+    let isSmoothed: Bool
+
+    private var interpolation: InterpolationMethod {
+        isSmoothed ? .catmullRom : .linear
+    }
+
+    var body: some View {
+        let now = Date()
+        let start = now.addingTimeInterval(-86_400)
+        let visibleSamples = samples.filter { $0.timestamp >= start && $0.timestamp <= now }
+        let chartSamples = visibleSamples.isEmpty
+            ? [
+                ConsumptionRateSample(timestamp: start, rawPerSecond: 0),
+                ConsumptionRateSample(timestamp: now, rawPerSecond: 0)
+            ]
+            : visibleSamples
+        let maxValue = chartSamples.map { $0.dollars(for: unit) }.max() ?? 0
+        let yMax = maxValue > 0 ? maxValue * 1.18 : 0.01
+
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("消耗速率")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.86))
+
+                Text("最近24小时")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.42))
+
+                Spacer(minLength: 8)
+
+                Text(currentRateText)
+                    .font(.system(size: 11, weight: .semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(.white.opacity(0.72))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
+            }
+
+            Chart {
+                RuleMark(y: .value("零", 0))
+                    .foregroundStyle(.white.opacity(0.18))
+
+                ForEach(chartSamples) { sample in
+                    AreaMark(
+                        x: .value("时间", sample.timestamp),
+                        y: .value("消耗速率", sample.dollars(for: unit))
+                    )
+                    .interpolationMethod(interpolation)
+                    .foregroundStyle(
+                        LinearGradient(
+                            colors: [
+                                Color(red: 0.42, green: 0.88, blue: 1).opacity(0.30),
+                                Color(red: 0.53, green: 0.45, blue: 1).opacity(0.05)
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+
+                    LineMark(
+                        x: .value("时间", sample.timestamp),
+                        y: .value("消耗速率", sample.dollars(for: unit))
+                    )
+                    .interpolationMethod(interpolation)
+                    .lineStyle(StrokeStyle(lineWidth: 2.1, lineCap: .round, lineJoin: .round))
+                    .foregroundStyle(
+                        LinearGradient(
+                            colors: [
+                                Color(red: 0.46, green: 0.92, blue: 1),
+                                Color(red: 0.72, green: 0.55, blue: 1)
+                            ],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    )
+                }
+
+                if let latest = chartSamples.last {
+                    PointMark(
+                        x: .value("时间", latest.timestamp),
+                        y: .value("消耗速率", latest.dollars(for: unit))
+                    )
+                    .symbolSize(22)
+                    .foregroundStyle(Color(red: 0.78, green: 0.96, blue: 1))
+                }
+            }
+            .chartXScale(domain: start...now)
+            .chartYScale(domain: 0...yMax)
+            .chartXAxis {
+                AxisMarks(values: .stride(by: .hour, count: 6)) { value in
+                    AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5))
+                        .foregroundStyle(.white.opacity(0.08))
+                    AxisValueLabel {
+                        if let date = value.as(Date.self) {
+                            Text(date, format: .dateTime.hour(.twoDigits(amPM: .omitted)))
+                                .font(.system(size: 8, weight: .medium))
+                                .foregroundStyle(.white.opacity(0.42))
+                        }
+                    }
+                }
+            }
+            .chartYAxis {
+                AxisMarks(position: .leading, values: .automatic(desiredCount: 3)) { value in
+                    AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5))
+                        .foregroundStyle(.white.opacity(0.08))
+                    AxisValueLabel {
+                        if let rate = value.as(Double.self) {
+                            Text(ChartRateFormatter.format(rate))
+                                .font(.system(size: 8, weight: .medium))
+                                .foregroundStyle(.white.opacity(0.42))
+                        }
+                    }
+                }
+            }
+            .chartPlotStyle { plotArea in
+                plotArea
+                    .background(.white.opacity(0.035))
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+            .frame(height: 86)
+        }
+        .padding(.horizontal, 13)
+        .padding(.vertical, 10)
+        .background(GlassCardBackground(cornerRadius: 17, castsShadow: false))
+        .animation(.smooth(duration: 0.25), value: samples)
     }
 }
 
@@ -770,13 +1297,15 @@ struct DesktopGlassShell<Content: View>: View {
     @ViewBuilder let content: Content
 
     var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 30, style: .continuous)
+
         content
             .background {
                 ZStack {
                     VisualEffectView(material: .hudWindow, blendingMode: .behindWindow)
-                        .clipShape(RoundedRectangle(cornerRadius: 30, style: .continuous))
+                        .clipShape(shape)
 
-                    RoundedRectangle(cornerRadius: 30, style: .continuous)
+                    shape
                         .fill(
                             LinearGradient(
                                 colors: [
@@ -790,9 +1319,10 @@ struct DesktopGlassShell<Content: View>: View {
                         )
                 }
             }
+            .clipShape(shape)
             .overlay(
-                RoundedRectangle(cornerRadius: 30, style: .continuous)
-                    .stroke(
+                shape
+                    .strokeBorder(
                         LinearGradient(
                             colors: [.white.opacity(0.60), .white.opacity(0.12), .white.opacity(0.46)],
                             startPoint: .topLeading,
@@ -809,22 +1339,35 @@ struct SettingsPanel: View {
     @EnvironmentObject private var viewModel: MonitorViewModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("HyperAPI 余额监控")
-                .font(.title3.weight(.semibold))
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("HyperAPI 余额监控")
+                    .font(.title3.weight(.semibold))
 
-            Text("Token 从 macOS Keychain 读取。若需要重新授权，请在终端运行 scripts/setup-hyperapi-token.sh。")
-                .foregroundStyle(.secondary)
+                Text("Token 从 macOS Keychain 读取。若需要重新授权，请在终端运行 scripts/setup-hyperapi-token.sh。")
+                    .foregroundStyle(.secondary)
 
-            Picker("刷新频率", selection: $viewModel.refreshInterval) {
-                ForEach(RefreshInterval.allCases) { interval in
-                    Text(interval.rawValue).tag(interval)
+                Picker("刷新频率", selection: $viewModel.refreshInterval) {
+                    ForEach(RefreshInterval.allCases) { interval in
+                        Text(interval.rawValue).tag(interval)
+                    }
                 }
-            }
-            .pickerStyle(.segmented)
+                .pickerStyle(.segmented)
 
-            Button("立即刷新") {
-                Task { await viewModel.refresh() }
+                Picker("消耗速率单位", selection: $viewModel.consumptionRateUnit) {
+                    ForEach(ConsumptionRateUnit.allCases) { unit in
+                        Text(unit.label).tag(unit)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                ConsumptionRateChartSettings()
+
+                ProgressFillSettings()
+
+                Button("立即刷新") {
+                    Task { await viewModel.refresh() }
+                }
             }
         }
     }
@@ -943,10 +1486,12 @@ struct SubscriptionCard: View {
 
 struct ProgressGlassBar: View {
     let progress: Double
+    @EnvironmentObject private var viewModel: MonitorViewModel
 
     var body: some View {
         GeometryReader { proxy in
             let width = max(8, proxy.size.width * min(max(progress, 0), 1))
+            let theme = viewModel.progressThemeColor
 
             ZStack(alignment: .leading) {
                 Capsule()
@@ -956,20 +1501,31 @@ struct ProgressGlassBar: View {
                             .stroke(.white.opacity(0.18), lineWidth: 1)
                     )
 
-                Capsule()
-                    .fill(
-                        LinearGradient(
-                            colors: [
-                                Color(red: 0.12, green: 0.43, blue: 1.0),
-                                Color(red: 0.42, green: 0.37, blue: 1.0),
-                                Color(red: 0.88, green: 0.28, blue: 1.0)
-                            ],
-                            startPoint: .leading,
-                            endPoint: .trailing
+                if viewModel.progressFillMode == .rainbow {
+                    TimelineView(.animation) { context in
+                        Capsule()
+                            .fill(
+                                LinearGradient(
+                                    colors: ProgressRainbow.colors(at: context.date),
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                            )
+                            .frame(width: width)
+                            .shadow(color: .white.opacity(0.30), radius: 7, x: 0, y: 0)
+                    }
+                } else {
+                    Capsule()
+                        .fill(
+                            LinearGradient(
+                                colors: theme.colors,
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
                         )
-                    )
-                    .frame(width: width)
-                    .shadow(color: Color(red: 0.48, green: 0.38, blue: 1).opacity(0.42), radius: 7, x: 0, y: 0)
+                        .frame(width: width)
+                        .shadow(color: theme.shadowColor.opacity(0.42), radius: 7, x: 0, y: 0)
+                }
             }
         }
         .frame(height: 18)
@@ -1491,6 +2047,43 @@ enum MoneyFormatter {
             cents = 1
         }
         return cents
+    }
+}
+
+enum ConsumptionRateFormatter {
+    static func format(rawPerSecond: Double, unit: ConsumptionRateUnit) -> String {
+        let dollars = max(0, rawPerSecond) * unit.seconds / 500_000.0
+        let decimals: Int
+        if dollars == 0 {
+            decimals = 2
+        } else if dollars >= 0.01 {
+            decimals = 2
+        } else if dollars >= 0.0001 {
+            decimals = 4
+        } else {
+            decimals = 6
+        }
+
+        return String(format: "$%.\(decimals)f/%@", dollars, unit.periodName)
+    }
+}
+
+enum ChartRateFormatter {
+    static func format(_ value: Double) -> String {
+        let amount = max(0, value)
+        if amount >= 100 {
+            return String(format: "$%.0f", amount)
+        }
+        if amount >= 1 {
+            return String(format: "$%.1f", amount)
+        }
+        if amount >= 0.01 {
+            return String(format: "$%.2f", amount)
+        }
+        if amount >= 0.0001 {
+            return String(format: "$%.4f", amount)
+        }
+        return String(format: "$%.6f", amount)
     }
 }
 
