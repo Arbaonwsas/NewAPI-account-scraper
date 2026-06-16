@@ -18,7 +18,8 @@ let package = Package(
             name: "NewAPIAccountMonitor",
             linkerSettings: [
                 .linkedFramework("AppKit"),
-                .linkedFramework("Security")
+                .linkedFramework("Security"),
+                .linkedFramework("ServiceManagement")
             ]
         )
     ]

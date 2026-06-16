@@ -1,7 +1,9 @@
 import AppKit
 import Charts
+import Combine
 import Foundation
 import Security
+import ServiceManagement
 import SwiftUI
 
 @main
@@ -10,20 +12,6 @@ struct NewAPIAccountMonitorApp: App {
     @StateObject private var viewModel = MonitorViewModel.shared
 
     var body: some Scene {
-        MenuBarExtra {
-            MenuBarSettingsPanel(appDelegate: appDelegate)
-                .environmentObject(viewModel)
-                .frame(width: 430)
-                .padding(16)
-                .task {
-                    await viewModel.refresh()
-                }
-        } label: {
-            Text(viewModel.menuBarTitle)
-                .monospacedDigit()
-        }
-        .menuBarExtraStyle(.window)
-
         Settings {
             SettingsPanel()
                 .environmentObject(viewModel)
@@ -36,13 +24,69 @@ struct NewAPIAccountMonitorApp: App {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     private let viewModel = MonitorViewModel.shared
+    private let launchAtLogin = LaunchAtLoginController.shared
+    private var statusItem: NSStatusItem?
+    private var popover: NSPopover?
+    private var cancellables = Set<AnyCancellable>()
     private var panel: NSPanel?
     @Published private(set) var isPositioningMode = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        configureStatusItem()
+        launchAtLogin.sync()
         showDesktopWidget()
         Task { await viewModel.refresh() }
+    }
+
+    private func configureStatusItem() {
+        let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(toggleSettingsPopover(_:))
+        statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        self.statusItem = statusItem
+
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.animates = true
+        popover.contentSize = NSSize(width: 430, height: 560)
+        popover.contentViewController = NSHostingController(
+            rootView: MenuBarSettingsPanel(appDelegate: self)
+                .environmentObject(viewModel)
+                .frame(width: 430)
+                .padding(16)
+                .task {
+                    await self.viewModel.refresh()
+                }
+        )
+        self.popover = popover
+
+        updateStatusItemTitle()
+        viewModel.objectWillChange
+            .sink { [weak self] _ in
+                DispatchQueue.main.async {
+                    self?.updateStatusItemTitle()
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    @objc private func toggleSettingsPopover(_ sender: Any?) {
+        guard let button = statusItem?.button, let popover else { return }
+
+        if popover.isShown {
+            popover.performClose(sender)
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        }
+    }
+
+    private func updateStatusItemTitle() {
+        guard let button = statusItem?.button else { return }
+        button.title = viewModel.menuBarTitle
+        button.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .medium)
+        button.toolTip = "HyperAPI 余额监控"
     }
 
     private func showDesktopWidget() {
@@ -61,6 +105,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
     func togglePositioningMode() {
         setPositioningMode(!isPositioningMode)
+    }
+}
+
+@MainActor
+final class LaunchAtLoginController: ObservableObject {
+    static let shared = LaunchAtLoginController()
+
+    @Published private(set) var isEnabled = false
+    @Published private(set) var statusText = ""
+    @Published private(set) var lastError: String?
+
+    private init() {
+        sync()
+    }
+
+    func sync() {
+        let status = SMAppService.mainApp.status
+        isEnabled = status == .enabled
+        statusText = Self.statusText(for: status)
+    }
+
+    func setEnabled(_ enabled: Bool) {
+        lastError = nil
+
+        do {
+            let service = SMAppService.mainApp
+            switch (enabled, service.status) {
+            case (true, .enabled), (true, .requiresApproval), (false, .notRegistered):
+                break
+            case (true, _):
+                try service.register()
+            case (false, .enabled), (false, .requiresApproval):
+                try service.unregister()
+            case (false, _):
+                break
+            }
+        } catch {
+            lastError = "开机自启设置失败：\(error.localizedDescription)"
+        }
+
+        sync()
+    }
+
+    private static func statusText(for status: SMAppService.Status) -> String {
+        switch status {
+        case .enabled:
+            return "已加入 macOS 登录项。"
+        case .requiresApproval:
+            return "需要在系统设置 > 通用 > 登录项中允许。"
+        case .notFound:
+            return "当前运行方式无法注册登录项，请从 .app 启动后再开启。"
+        case .notRegistered:
+            return "关闭后不会随系统登录启动。"
+        @unknown default:
+            return "登录项状态未知。"
+        }
     }
 }
 
@@ -776,6 +876,10 @@ struct MenuBarSettingsPanel: View {
 
                 Divider()
 
+                LaunchAtLoginSettings()
+
+                Divider()
+
                 VStack(alignment: .leading, spacing: 10) {
                     Toggle("消耗淡出特效", isOn: $viewModel.isConsumptionEffectEnabled)
                         .font(.subheadline.weight(.semibold))
@@ -882,6 +986,38 @@ struct MenuBarSettingsPanel: View {
             }
         }
         .frame(maxHeight: 560)
+    }
+}
+
+struct LaunchAtLoginSettings: View {
+    @ObservedObject private var controller = LaunchAtLoginController.shared
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Toggle(
+                "开机自启",
+                isOn: Binding(
+                    get: { controller.isEnabled },
+                    set: { controller.setEnabled($0) }
+                )
+            )
+            .font(.subheadline.weight(.semibold))
+
+            if let error = controller.lastError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text(controller.statusText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .onAppear {
+            controller.sync()
+        }
     }
 }
 
@@ -1364,6 +1500,10 @@ struct SettingsPanel: View {
                 ConsumptionRateChartSettings()
 
                 ProgressFillSettings()
+
+                Divider()
+
+                LaunchAtLoginSettings()
 
                 Button("立即刷新") {
                     Task { await viewModel.refresh() }

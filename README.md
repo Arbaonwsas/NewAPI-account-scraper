@@ -21,6 +21,7 @@ HyperAPI Account Monitor 是一个个人用的 HyperAPI 余额与订阅套餐监
 - 将 access token 保存到 macOS Keychain。
 - 后续刷新直接使用 Keychain token，不需要每次登录。
 - macOS 桌面常驻悬浮窗。
+- 支持将 macOS 悬浮窗加入登录项，实现开机登录后自启。
 - 菜单栏状态项可配置显示内容：
   - 当前余额
   - 历史消耗
@@ -193,6 +194,8 @@ swift run NewAPIAccountMonitor
 
 悬浮窗默认处于桌面底层，不遮挡普通应用窗口。需要移动位置时，在菜单栏设置里开启定位模式，拖动完成后再锁定位置。
 
+如果需要开机登录后自动启动，请先从 `.app` 启动应用，再在菜单栏设置中开启“开机自启”。使用 `swift run NewAPIAccountMonitor` 启动时通常没有完整应用包，macOS 可能无法把它注册为登录项。
+
 #### 6. 使用菜单栏设置
 
 点击 macOS 顶部菜单栏中的状态项，可以打开设置面板。设置面板支持：
@@ -201,6 +204,7 @@ swift run NewAPIAccountMonitor
 - 选择菜单栏显示内容：当前余额、历史消耗、请求次数、某个订阅剩余额度或某个订阅剩余百分比。
 - 设置悬浮窗展示的订阅数量。
 - 设置自动刷新频率：10 秒、30 秒、1 分钟、5 分钟。
+- 开关开机自启。
 - 开关余额/订阅消耗淡出特效。
 - 进入或退出悬浮窗定位模式。
 - 对仍有效且未用完的订阅，单独选择是否在悬浮窗中展示。
@@ -240,6 +244,8 @@ swift run NewAPIAccountMonitor
 如果站点启用了 Cloudflare Turnstile，纯命令行登录可能无法完成，需要额外处理人工验证。
 
 如果悬浮窗没有数据，先运行 `./scripts/fetch-hyperapi-token.sh` 确认命令行抓取是否正常。
+
+如果“开机自启”提示需要允许，请打开 macOS“系统设置 > 通用 > 登录项”，允许 NewAPIAccountMonitor 作为登录项运行。
 
 ### 菜单栏与悬浮窗
 
@@ -325,6 +331,7 @@ rg -n -i --glob '!captures/**' --glob '!.env' '(password|secret|token|authorizat
 
 - 仅对 HyperAPI 测试成功。
 - macOS 悬浮窗仅支持 macOS。
+- 开机自启依赖 macOS 登录项，需要从 `.app` 启动，并且应用需要可被系统接受的代码签名。
 - 其他 NewAPI/New API 部署可能字段、鉴权方式或接口路径不同。
 - 如果站点启用 Cloudflare Turnstile，纯脚本登录可能需要额外人工验证。
 - 当前 `.app` 打包方式仍是开发期临时方案，正式发布还需要补充签名、图标、版本号和安装流程。
